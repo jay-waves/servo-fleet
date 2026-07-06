@@ -28,6 +28,7 @@ set(FLEET_SOURCES
   src/driver_motor.cc
   src/error.cc
   src/runtime.cc
+  src/thread_tuning.cc
   src/codec_bit.cc
   src/checksum.cc
   src/codec_can.cc
@@ -51,15 +52,22 @@ target_link_libraries(${FLEET_TARGET}_obj
     asio::asio
     nlohmann_json::nlohmann_json)
 
+set(FLEET_PLATFORM_LIBS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(Threads REQUIRED)
+  list(APPEND FLEET_PLATFORM_LIBS Threads::Threads)
+  target_link_libraries(${FLEET_TARGET}_obj PRIVATE ${FLEET_PLATFORM_LIBS})
+endif()
+
 # dll
 add_library(${FLEET_TARGET} SHARED)
-target_link_libraries(${FLEET_TARGET} PUBLIC ${FLEET_TARGET}_obj)
+target_link_libraries(${FLEET_TARGET} PUBLIC ${FLEET_TARGET}_obj PRIVATE ${FLEET_PLATFORM_LIBS})
 
 
 # lib
 if(FLEET_BUILD_STATIC)
   add_library(${FLEET_TARGET}_static STATIC)
-  target_link_libraries(${FLEET_TARGET}_static PUBLIC ${FLEET_TARGET}_obj)
+  target_link_libraries(${FLEET_TARGET}_static PUBLIC ${FLEET_TARGET}_obj PRIVATE ${FLEET_PLATFORM_LIBS})
   set_target_properties(${FLEET_TARGET}_static PROPERTIES OUTPUT_NAME ${FLEET_TARGET})
 endif()
 

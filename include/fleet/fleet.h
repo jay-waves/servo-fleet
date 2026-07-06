@@ -43,6 +43,9 @@ struct fleet_config {
         uint16_t local_port = 0;
     };
 
+    int command_cpu = -1;
+    int command_fifo_priority = 80;
+    bool lock_memory = true;
     std::vector<channel_config> channels;
     std::vector<motor_config> motors;
 };
