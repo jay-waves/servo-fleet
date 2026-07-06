@@ -1,0 +1,100 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 25,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "debug-x64-clang",
+            "displayName": "Debug x64 Llvm",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/debug-x64-clang",
+            "toolchainFile": "${sourceDir}/cmake/amd64-linux-llvm.cmake",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O1",
+                "FLEET_BUILD_TESTS": "ON",
+                "FLEET_BUILD_PYBIND": "OFF"
+            }
+        },
+        {
+            "name": "debug-x64-msvc",
+            "displayName": "Debug x64 MSVC",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/debug-x64-msvc",
+            "toolchainFile": "${sourceDir}/cmake/amd64-win-msvc.cmake",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "FLEET_BUILD_TESTS": "ON",
+                "FLEET_BUILD_PYBIND": "OFF"
+            }
+        },
+        {
+            "name": "release-x64",
+            "displayName": "Release",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/release-x64",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "gcc",
+                "CMAKE_CXX_COMPILER": "g++",
+                "FLEET_BUILD_TESTS": "OFF",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O2 -DNDEBUG",
+                "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON"
+            }
+        },
+        {
+            "name": "release-aarch64",
+            "displayName": "Release RK3588",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/release-aarch64",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/aarch64-linux-gnu.cmake",
+                "FLEET_BUILD_TESTS": "ON",
+                "CMAKE_CXX_FLAGS_RELEASE": "-Os -DNDEBUG",
+                "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "debug-x64-clang",
+            "configurePreset": "debug-x64-clang"
+        },
+        {
+            "name": "release-x64",
+            "configurePreset": "release-x64"
+        },
+        {
+            "name": "release-aarch64",
+            "configurePreset": "release-aarch64"
+        },
+        {
+            "name": "debug-x64-msvc",
+            "displayName": "Build Debug x64 MSVC",
+            "configurePreset": "debug-x64-msvc",
+            "jobs": 8
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "debug-x64-clang",
+            "configurePreset": "debug-x64-clang",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "debug-x64-msvc",
+            "displayName": "Test Debug x64 MSVC",
+            "configurePreset": "debug-x64-msvc",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ]
+}
