@@ -25,7 +25,8 @@ constexpr float pvt_position_limit_r = 12.5f;
 
 constexpr auto command_period = 2500us;
 constexpr milliseconds query_wait = 100ms;
-constexpr auto feedback_max_age = command_period * 2;
+constexpr auto feedback_max_age = 2ms;
+constexpr uint64_t max_consecutive_stale_feedback = 3;
 constexpr milliseconds startup_wait = 300ms;
 constexpr milliseconds settle_duration = 1500ms;
 constexpr milliseconds tune_duration = 12000ms;
@@ -368,6 +369,7 @@ bool run_stable_pvt_loop(const motor_ptr &motor, duration run_duration, TargetFn
     const auto start = std::chrono::steady_clock::now();
     auto next_time = start;
     auto last_print = start;
+    uint64_t consecutive_stale_feedback = 0;
 
     // Seed one Status1 response. Subsequent iterations reject stale feedback before sending.
     const auto initial = target_at(duration::zero());
@@ -385,6 +387,7 @@ bool run_stable_pvt_loop(const motor_ptr &motor, duration run_duration, TargetFn
 
         const auto woke_at = std::chrono::steady_clock::now();
         ++stats.cycles;
+        bool deadline_missed = woke_at >= next_time + command_period;
         if (woke_at > next_time) {
             stats.max_wakeup_lateness =
                 std::max(stats.max_wakeup_lateness, woke_at - next_time);
@@ -393,15 +396,33 @@ bool run_stable_pvt_loop(const motor_ptr &motor, duration run_duration, TargetFn
         const auto snapshot = motor->pvt_feedback();
         if (!snapshot.fresh(woke_at, feedback_max_age)) {
             ++stats.stale_feedback;
+            ++consecutive_stale_feedback;
+            if (deadline_missed) {
+                ++stats.deadline_misses;
+            }
             if (woke_at - last_print >= 1s) {
                 FLEET_WARN("pvt tune stale feedback phase={} count={} received={} coherent={}",
                            phase, stats.stale_feedback, snapshot.received(), snapshot.coherent());
                 last_print = woke_at;
             }
+            if (consecutive_stale_feedback >= max_consecutive_stale_feedback) {
+                FLEET_ERROR("pvt tune abort phase={}: consecutive stale feedback={} max_age_us={}",
+                            phase, consecutive_stale_feedback,
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                feedback_max_age)
+                                .count());
+                total_stats += stats;
+                report_loop_stats(phase, stats);
+                return false;
+            }
             continue;
         }
+        consecutive_stale_feedback = 0;
         if (snapshot.error.value != motor_err::none) {
             ++stats.rejected_feedback;
+            if (deadline_missed) {
+                ++stats.deadline_misses;
+            }
             continue;
         }
 
@@ -423,8 +444,10 @@ bool run_stable_pvt_loop(const motor_ptr &motor, duration run_duration, TargetFn
 
         const auto finished_at = std::chrono::steady_clock::now();
         if (finished_at >= next_time + command_period) {
-            stats.deadline_misses += static_cast<uint64_t>(
-                (finished_at - next_time) / command_period);
+            deadline_missed = true;
+        }
+        if (deadline_missed) {
+            ++stats.deadline_misses;
         }
     }
 

@@ -202,8 +202,13 @@ template <Command T> err_code runtime_t::send_commands(std::span<const T> comman
 }
 
 template <MotorCommand T> err_code runtime_t::send_motor_commands(std::span<const T> commands) {
-    vector<typename motor_driver::batch_commands<T>> batches;
-    batches.reserve(motor_drivers_.size());
+    // Reuse the per-thread batch storage: this path runs on every control period and must not
+    // allocate after its first invocation.
+    thread_local vector<typename motor_driver::batch_commands<T>> batches;
+    batches.clear();
+    if (batches.capacity() < motor_drivers_.size()) {
+        batches.reserve(motor_drivers_.size());
+    }
     for (auto &driver : motor_drivers_)
         batches.emplace_back(*driver);
 
