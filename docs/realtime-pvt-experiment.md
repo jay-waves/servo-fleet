@@ -1,92 +1,101 @@
 # PVT 实时调度实验
 
-实验代码位于 `rt-linux` 分支；`main` 只包含跨平台的 2.5 ms PVT 稳定循环、原子反馈快照和 stale 统计。当前 WSL 只用于编译、回环功能和失败路径检查，不能作为实时性结果。
+实验代码位于 `rt-linux`；`main` 只保留跨平台的 2.5 ms 绝对时间循环、原子反馈快照、2 ms stale 判定和统计。WSL 只用于编译与回环功能检查，不能产出实时性结论。
 
-## 构建与准备
+## 构建与前检
 
 ```bash
 cmake -S . -B build/rt-release -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DFLEET_BUILD_TESTS=ON
 cmake --build build/rt-release -j
 ctest --test-dir build/rt-release --output-on-failure
-```
 
-目标机先确认 CPU 编号和内核支持：
-
-```bash
+uname -a
 lscpu -e=CPU,CORE,SOCKET,MAXMHZ,ONLINE
 grep -E 'CONFIG_PREEMPT(_RT)?=|CONFIG_SCHED_DEBUG=' /boot/config-$(uname -r)
 ulimit -r
-ulimit -l
 ```
 
-CPU0 在本实验中代表 RX/IRQ 核，CPU4~7 代表大核；本地回环没有真实网卡 IRQ，因此这里只验证线程迁移和调度，不验证硬件 IRQ 链路，也不配置 CPU 隔离。`SCHED_FIFO`、`SCHED_DEADLINE` 和 `mlockall` 需要相应权限，可用 root 运行，或按现场安全策略授予 `CAP_SYS_NICE`、`CAP_IPC_LOCK`。配置失败时程序会非零退出，不会静默降级。
+目标机应使用 PREEMPT_RT 内核。CPU0 作为 RX/IRQ 核，CPU4~7 作为大核；不设置 `isolcpus`，CPU4~7 不独占。回环 UDP 没有真实网卡 IRQ，因此本实验验证 RX 线程迁移，不验证硬件 IRQ 路径。调度或亲和性设置失败会非零退出，且程序会读回核验实际策略。
 
-## 先测 WCET 与参数
+默认不调用进程级 `mlockall`，避免它只影响部分组。若要测试锁页，所有组统一增加 `--mlock`，并提前检查 `ulimit -l`。
 
-固定 RX 在 CPU0、Control 单独放 CPU4，用较长时间估算单核控制计算尾延迟：
+## 负载模型
+
+拓扑固定为 `2 UDP × 2 CAN port × 8 CAN ID = 32 motors`。每个 CAN port 独立按 1 Mbit/s、每帧保守 128 bit 串行化 PVT 命令与 Status1：
+
+```text
+8 motors × 2 directions × 128 bit × 400 Hz = 819.2 kbit/s / CAN port
+```
+
+因此每条物理 CAN 约有 18% 的仲裁、位填充和误差余量。Mock 不会补发突发：每个 port 的实际 Status1 发送间隔不小于 128 us。反馈延迟为 50~350 us，并由固定种子、CAN port、CAN ID 和 PVT 命令值的哈希确定；相同逻辑命令在各实验组得到相同延迟，不会因某组丢包而错位。
+
+Control 每 2500 us 按绝对时间唤醒并始终发送全部 32 个 PVT。快照超过 2 ms 只会被拒绝并计入 `stale`，不会降低下一轮总线负载；任一电机默认连续 3 轮 stale 会使该次运行无效。`--stale-fail-cycles 0` 只供 WSL smoke 使用，正式实验禁止关闭。
+
+## WCET 预试验
+
+先固定 Control 到一个大核，运行至少 120 s：
 
 ```bash
 build/rt-release/realtime_pvt_stress \
   --profile fair --control-cpus 4 --duration 120 --warmup 5 \
-  --seed 0x5EED1234 --no-mlock --output wcet.csv
+  --seed 0x5EED1234 --output wcet.csv
 ```
 
-查看 `control_exec_max_us` 和 `control_exec_p99_us`。控制周期固定为 2500 us；默认 deadline 为 2000 us、runtime 为 500 us。根据目标机 WCET 留出余量后，用 `--runtime-us` 和 `--deadline-us` 调整，并保持：
+以 `control_exec_max_us` 作为本次观测到的 WCET 上界样本，并结合多轮 p99/max 选参数。周期固定 2500 us；若做探索性 deadline 测试，必须满足 `observed WCET < runtime <= deadline <= 2500 us`。一次压力测试不能证明理论 WCET。
 
-```text
-WCET < runtime <= deadline <= 2500 us
-```
+## 主实验矩阵
 
-## 五组实验
-
-每组使用相同种子，建议至少重复 10 次。以下命令会把每次结果追加到同一 CSV：
-
-```bash
-for profile in baseline fair fifo deadline-control deadline-all; do
-  for repeat in $(seq 1 10); do
-    sudo build/rt-release/realtime_pvt_stress \
-      --profile "$profile" --duration 60 --warmup 5 \
-      --seed 0x5EED1234 --irq-cpu 0 --control-cpus 4,5,6,7 \
-      --runtime-us 500 --deadline-us 2000 --output realtime-results.csv
-  done
-done
-```
-
-配置对应关系：
+在“不隔离 CPU”的前提下，主矩阵收紧为三个可公平执行的组：
 
 | profile | RX | Control |
 | --- | --- | --- |
 | `baseline` | 完全不配置（继承） | 完全不配置（继承） |
 | `fair` | `SCHED_OTHER`, CPU0 | `SCHED_OTHER`, CPU4~7 |
 | `fifo` | `SCHED_OTHER`, CPU0 | `SCHED_FIFO`, CPU4~7 |
-| `deadline-control` | `SCHED_OTHER`, CPU0 | `SCHED_DEADLINE`, CPU4~7 |
-| `deadline-all` | `SCHED_DEADLINE`, CPU4~7 | `SCHED_DEADLINE`, CPU4~7 |
 
-压测创建两个 UDP 回环 mock，每路 16 个电机。Control 以 400 Hz 批量发送 PVT；每个 mock 用固定种子产生 50~350 us 延迟，并按每帧 128 us（1 Mbit/s 经典 CAN 保守估算）串行返回 Status1。16 × 400 × 128 = 819.2 kbit/s，因此命令和反馈各自不超过每路的方向带宽上限。该模型分别限制网关发令方向和反馈方向，不等价于把双向报文放在一条半双工物理 CAN 上做仲裁；实机总线利用率仍需用 CAN 分析仪确认。
+每组至少重复 10 次，使用同一种子但随机化组顺序，并保存实际顺序。示例单次命令：
 
-CSV 重点字段：
+```bash
+sudo build/rt-release/realtime_pvt_stress \
+  --profile fifo --duration 60 --warmup 5 --seed 0x5EED1234 \
+  --irq-cpu 0 --control-cpus 4,5,6,7 --fifo-priority 80 \
+  --output realtime-results.csv
+```
 
-- `jitter_*`：实际唤醒时间减绝对计划时间；计划时间始终累加 2500 us，不随本轮迟到漂移。
-- `control_exec_*`：读取 32 份快照、拒绝 stale、计算目标并提交批命令的耗时，可作为 WCET 样本。
-- `e2e_*`：批命令提交前时间戳到对应 Status1 首次被 Control 使用的延迟。
-- `rx_control_*`：SDK 从内核 `recvfrom` 返回后记录的 RX 时间戳到 Control 使用快照的延迟；`max` 是“内核 socket 出队 → Control 使用”的近似最大值。
-- `deadline_misses`：本轮 Control 完成时间越过下一次 2.5 ms release 的次数。
-- `cpu_utilization`：Control 线程 CPU time / wall time；`involuntary_switches` 作为调度抢占次数，`voluntary_switches` 主要包含周期等待。
-- `stale`：快照缺失、不来自同一 Status1，或年龄超过 5 ms 的累计“电机·周期”次数。
+不要在有的组使用 `sudo`、锁页或额外后台负载而在其他组不使用。正式采样前固定 governor/频率策略，并记录温度、内核版本、命令行和实验顺序。
 
-需要同时观察内核调度时，可单独运行一组：
+`SCHED_DEADLINE` 的线程 affinity 必须覆盖所在 scheduler root domain。PREEMPT_RT 不改变这一规则，所以“只亲和 CPU4~7、但不建立相应 root domain”不是有效配置；原 B/C 不进入主矩阵。`deadline-cpuset` 仅供已由管理员把 CPU4~7 建成独立 root domain 的探索试验，这会改变“不隔离 CPU”的前提，结果必须单列，不能与以上三组作公平因果比较：
+
+```bash
+sudo build/rt-release/realtime_pvt_stress \
+  --profile deadline-cpuset --duration 60 --warmup 5 \
+  --control-cpus 4,5,6,7 --runtime-us 500 --deadline-us 2000 \
+  --seed 0x5EED1234 --output deadline-exploratory.csv
+```
+
+## 指标与内核观测
+
+- `jitter_*`：实际唤醒减绝对计划时间。
+- `control_exec_*`：一次 Control job 的执行时间。
+- `e2e_*`：PVT 提交到对应 Status1 首次被 Control 使用。
+- `rx_control_*`：Linux `SO_TIMESTAMPNS` 软件 RX 时间戳到 Control 使用；这是“内核接收路径 → Control”的近似值。
+- `deadline_misses`：job 完成越过下一 release；stale/rejected job 也统计。
+- `cpu_utilization`、自愿/非自愿切换：只覆盖采样窗口，不含 warmup；非自愿切换是 Control 抢占次数的近似值。
+- `stale`：缺失、不一致、有电机错误或内核 RX 时间戳年龄超过 2 ms 的“电机·周期”数。stale 样本仍进入端到端尾延迟统计，避免删掉最坏值。
+
+同时采集全进程/内核调度数据：
 
 ```bash
 sudo perf stat -e task-clock,context-switches,cpu-migrations,cycles,instructions \
   build/rt-release/realtime_pvt_stress \
-  --profile deadline-control --duration 60 --warmup 5 \
-  --seed 0x5EED1234 --output perf-run.csv
+  --profile fifo --duration 60 --warmup 5 --seed 0x5EED1234 \
+  --output perf-run.csv
 
 sudo perf sched record -a -- \
   build/rt-release/realtime_pvt_stress \
-  --profile deadline-control --duration 60 --warmup 5 --seed 0x5EED1234
+  --profile fifo --duration 60 --warmup 5 --seed 0x5EED1234
 sudo perf sched latency
 ```
 
-报告时保留内核版本、CPU governor/频率、命令行、CSV、`perf stat` 和 `perf sched latency`；不要混用不同种子或不同 runtime/deadline 的结果。
+最终报告同时保留 CSV、stderr 中的 mock 命令/反馈计数、`perf stat`、`perf sched latency`、内核配置和 CPU 频率信息。任何非零退出、`mock_errors`、连续 stale、命令数不足或调度配置失败的运行都应剔除并单独说明原因。

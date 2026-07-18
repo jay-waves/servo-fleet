@@ -118,6 +118,8 @@ class realtime_udp_channel {
         参数 bytes_view 指向 channel 内部接收缓冲区，只在本次 callback 返回前有效。
     */
     void set_rx_callback(std::function<void(bytes_view)> cb);
+    void set_timestamped_rx_callback(
+        std::function<void(bytes_view, std::chrono::steady_clock::time_point)> cb);
 
     /*
         有单次拷贝的接口

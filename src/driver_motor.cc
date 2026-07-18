@@ -213,8 +213,8 @@ motor_driver::motor_driver(std::unique_ptr<realtime_udp_channel> channel) : chan
 motor_driver::~motor_driver() { stop(); }
 
 void motor_driver::start() {
-    channel_->set_rx_callback([this](bytes_view packet) {
-        handle_packet(packet);
+    channel_->set_timestamped_rx_callback([this](bytes_view packet, time_point received_at) {
+        handle_packet(packet, received_at);
     });
     channel_->start();
 }
@@ -271,9 +271,13 @@ void motor_driver::benchmark_handle_packet(bytes_view packet) {
 }
 
 void motor_driver::handle_packet(bytes_view bytes) {
+    handle_packet(bytes, std::chrono::steady_clock::now());
+}
+
+void motor_driver::handle_packet(bytes_view bytes, time_point received_at) {
     decode_context context{
         .driver = this,
-        .received_at = std::chrono::steady_clock::now(),
+        .received_at = received_at,
     };
     if (const auto error = motor_codec::decode_each(bytes, &context, &motor_driver::handle_decoded_frame)) {
         FLEET_WARN("encos driver '{}' decode failed bytes={}", channel_->name(), bytes.size());

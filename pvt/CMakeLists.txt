@@ -14,6 +14,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(realtime_pvt_stress PRIVATE ${FLEET_TARGET} spdlog::spdlog Threads::Threads)
   set_target_properties(realtime_pvt_stress PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
   add_test(NAME realtime_pvt_stress_smoke
-           COMMAND realtime_pvt_stress --profile baseline --duration 1 --warmup 0 --no-mlock)
+           COMMAND realtime_pvt_stress --profile baseline --duration 1 --warmup 0
+                   --stale-fail-cycles 0)
   set_tests_properties(realtime_pvt_stress_smoke PROPERTIES TIMEOUT 10)
 endif()

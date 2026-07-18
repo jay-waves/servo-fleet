@@ -56,7 +56,18 @@ err_code set_affinity(const linux_thread_config &config) noexcept {
             return generic_error(EINVAL);
         CPU_SET(cpu, &cpus);
     }
-    return generic_error(pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus));
+    if (const auto error = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus))
+        return generic_error(error);
+
+    cpu_set_t effective;
+    CPU_ZERO(&effective);
+    if (const auto error = pthread_getaffinity_np(pthread_self(), sizeof(effective), &effective))
+        return generic_error(error);
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &cpus) != CPU_ISSET(cpu, &effective))
+            return generic_error(EINVAL);
+    }
+    return {};
 }
 
 err_code set_posix_policy(int policy, int priority) noexcept {
@@ -104,6 +115,18 @@ err_code set_policy(const linux_thread_config &config) noexcept {
     return generic_error(EINVAL);
 }
 
+err_code verify_policy(const linux_thread_config &config) noexcept {
+    if (config.policy == linux_scheduler_policy::inherit)
+        return {};
+    const auto effective = sched_getscheduler(0);
+    if (effective < 0)
+        return generic_error(errno);
+    const int expected = config.policy == linux_scheduler_policy::other    ? SCHED_OTHER
+                         : config.policy == linux_scheduler_policy::fifo  ? SCHED_FIFO
+                                                                          : SCHED_DEADLINE;
+    return effective == expected ? err_code{} : generic_error(EINVAL);
+}
+
 #endif
 
 } // namespace
@@ -119,8 +142,18 @@ err_code tune_current_thread(const linux_thread_config &config, std::string_view
         return error;
     }
     if (const auto error = set_policy(config)) {
-        FLEET_WARN("thread '{}' set scheduler failed policy={} error={}", name,
-                   static_cast<int>(config.policy), error.message());
+        if (config.policy == linux_scheduler_policy::deadline) {
+            FLEET_WARN("thread '{}' SCHED_DEADLINE failed error={}; require CAP_SYS_NICE and "
+                       "an affinity mask spanning its scheduler root domain",
+                       name, error.message());
+        } else {
+            FLEET_WARN("thread '{}' set scheduler failed policy={} error={}", name,
+                       static_cast<int>(config.policy), error.message());
+        }
+        return error;
+    }
+    if (const auto error = verify_policy(config)) {
+        FLEET_WARN("thread '{}' scheduler read-back mismatch error={}", name, error.message());
         return error;
     }
     if (config.lock_memory && mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {

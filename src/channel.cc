@@ -19,6 +19,13 @@
 #include <utility>
 #include <vector>
 
+#ifdef __linux__
+#include <cerrno>
+#include <cstring>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+
 namespace fleet {
 namespace {
 
@@ -58,6 +65,73 @@ void tune_socket_buffers(udp::socket &socket) {
         FLEET_DEBUG_KV(KV("msg", "UDP send buffer tune failed"), KV("error", error.message()));
     }
 }
+
+#ifdef __linux__
+void enable_kernel_rx_timestamps(udp::socket &socket) {
+    const int enabled = 1;
+    if (::setsockopt(socket.native_handle(), SOL_SOCKET, SO_TIMESTAMPNS, &enabled,
+                     sizeof(enabled)) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "enable SO_TIMESTAMPNS");
+    }
+}
+
+struct timestamped_datagram {
+    size_t size = 0;
+    udp::endpoint sender;
+    steady_clock::time_point received_at{};
+    asio::error_code error;
+};
+
+timestamped_datagram receive_timestamped(udp::socket &socket,
+                                         std::span<uint8_t> buffer) noexcept {
+    timestamped_datagram result;
+    sockaddr_in source{};
+    iovec data{.iov_base = buffer.data(), .iov_len = buffer.size()};
+    alignas(cmsghdr) std::array<char, CMSG_SPACE(sizeof(timespec))> control{};
+    msghdr message{};
+    message.msg_name = &source;
+    message.msg_namelen = sizeof(source);
+    message.msg_iov = &data;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+
+    const auto size = ::recvmsg(socket.native_handle(), &message, MSG_DONTWAIT);
+    if (size < 0) {
+        result.error = asio::error_code(errno, asio::error::get_system_category());
+        return result;
+    }
+    result.size = static_cast<size_t>(size);
+    result.sender = udp::endpoint(
+        asio::ip::address_v4(ntohl(source.sin_addr.s_addr)), ntohs(source.sin_port));
+
+    std::optional<timespec> kernel_time;
+    for (auto *header = CMSG_FIRSTHDR(&message); header != nullptr;
+         header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_TIMESTAMPNS &&
+            header->cmsg_len >= CMSG_LEN(sizeof(timespec))) {
+            timespec value{};
+            std::memcpy(&value, CMSG_DATA(header), sizeof(value));
+            kernel_time = value;
+            break;
+        }
+    }
+
+    const auto steady_now = steady_clock::now();
+    if (!kernel_time) {
+        result.received_at = steady_now;
+        return result;
+    }
+    const auto system_now = std::chrono::system_clock::now();
+    const auto packet_system = std::chrono::system_clock::time_point{
+        std::chrono::seconds(kernel_time->tv_sec) + std::chrono::nanoseconds(kernel_time->tv_nsec)};
+    const auto age = system_now - packet_system;
+    result.received_at = steady_now -
+        std::chrono::duration_cast<steady_clock::duration>(age);
+    return result;
+}
+#endif
 
 vector<uint8_t> make_send_storage(uint32_t send_queue_slots, uint32_t packet_cap) {
     if (packet_cap == 0 || send_queue_slots > UINT32_MAX / packet_cap) {
@@ -479,7 +553,7 @@ struct realtime_udp_channel::impl {
     token_bucket limit;
     std::atomic_bool stopped{false};
     udp_send_queue send_queue;
-    std::function<void(bytes_view)> receive_callback;
+    std::function<void(bytes_view, steady_clock::time_point)> receive_callback;
     std::optional<std::jthread> rx_thread;
     std::optional<std::jthread> tx_thread;
 
@@ -491,6 +565,9 @@ struct realtime_udp_channel::impl {
           send_queue(options.send_queue_slots, MOTOR_UDP_PACKET_CAP) {
         socket.open(udp::v4());
         tune_socket_buffers(socket);
+#ifdef __linux__
+        enable_kernel_rx_timestamps(socket);
+#endif
         socket.bind(udp::endpoint(udp::v4(), options.local_port));
         socket.non_blocking(true);
     }
@@ -527,7 +604,8 @@ struct realtime_udp_channel::impl {
         send_queue.cancel_wait();
     }
 
-    void set_receive_callback(std::function<void(bytes_view)> callback) {
+    void set_receive_callback(
+        std::function<void(bytes_view, steady_clock::time_point)> callback) {
         receive_callback = std::move(callback);
     }
 
@@ -604,6 +682,18 @@ struct realtime_udp_channel::impl {
             return;
         std::array<uint8_t, MAX_UDP_SIZE> buffer{};
         while (!stop_token.stop_requested() && !is_stopped()) {
+#ifdef __linux__
+            const auto packet = receive_timestamped(socket, buffer);
+            const auto &error = packet.error;
+            if (!error) {
+                if (!is_expected_sender(remote, packet.sender))
+                    continue;
+                if (receive_callback) {
+                    receive_callback(bytes_view(buffer.data(), packet.size), packet.received_at);
+                }
+                continue;
+            }
+#else
             udp::endpoint sender;
             asio::error_code error;
             const auto size = socket.receive_from(asio::buffer(buffer), sender, 0, error);
@@ -611,10 +701,11 @@ struct realtime_udp_channel::impl {
                 if (!is_expected_sender(remote, sender))
                     continue;
                 if (receive_callback) {
-                    receive_callback(bytes_view(buffer.data(), size));
+                    receive_callback(bytes_view(buffer.data(), size), steady_clock::now());
                 }
                 continue;
             }
+#endif
 
             if (error == asio::error::would_block || error == asio::error::try_again) {
                 std::this_thread::sleep_for(std::chrono::microseconds{100});
@@ -649,6 +740,14 @@ void realtime_udp_channel::start() {
 }
 
 void realtime_udp_channel::set_rx_callback(std::function<void(bytes_view)> callback) {
+    impl_->set_receive_callback(
+        [callback = std::move(callback)](bytes_view bytes, steady_clock::time_point) {
+            callback(bytes);
+        });
+}
+
+void realtime_udp_channel::set_timestamped_rx_callback(
+    std::function<void(bytes_view, steady_clock::time_point)> callback) {
     impl_->set_receive_callback(std::move(callback));
 }
 

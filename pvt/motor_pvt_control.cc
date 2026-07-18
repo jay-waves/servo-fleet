@@ -394,9 +394,23 @@ bool run_stable_pvt_loop(const motor_ptr &motor, duration run_duration, TargetFn
         }
 
         const auto snapshot = motor->pvt_feedback();
+        // Feedback is diagnostic for this open-loop PVT trajectory. Keep the command stream
+        // alive so a Status1-on-command device can recover after an isolated stale sample.
+        const auto target = target_at(woke_at - start);
+        if (!send_pvt(motor, target.position_r, target.velocity_radps)) {
+            ++stats.command_errors;
+            total_stats += stats;
+            report_loop_stats(phase, stats);
+            return false;
+        }
+        ++stats.commands_sent;
+
         if (!snapshot.fresh(woke_at, feedback_max_age)) {
             ++stats.stale_feedback;
             ++consecutive_stale_feedback;
+            if (std::chrono::steady_clock::now() >= next_time + command_period) {
+                deadline_missed = true;
+            }
             if (deadline_missed) {
                 ++stats.deadline_misses;
             }
@@ -420,22 +434,14 @@ bool run_stable_pvt_loop(const motor_ptr &motor, duration run_duration, TargetFn
         consecutive_stale_feedback = 0;
         if (snapshot.error.value != motor_err::none) {
             ++stats.rejected_feedback;
+            if (std::chrono::steady_clock::now() >= next_time + command_period) {
+                deadline_missed = true;
+            }
             if (deadline_missed) {
                 ++stats.deadline_misses;
             }
             continue;
         }
-
-        // Use actual wake time so an overrun computes the latest trajectory point instead of
-        // replaying an obsolete target.
-        const auto target = target_at(woke_at - start);
-        if (!send_pvt(motor, target.position_r, target.velocity_radps)) {
-            ++stats.command_errors;
-            total_stats += stats;
-            report_loop_stats(phase, stats);
-            return false;
-        }
-        ++stats.commands_sent;
 
         if (woke_at - last_print >= 1s) {
             print_tracking_error(snapshot, target.position_r, target.velocity_radps);

@@ -87,6 +87,7 @@ class motor_driver final {
 
   private:
     void handle_packet(bytes_view packet);
+    void handle_packet(bytes_view packet, time_point received_at);
     static void handle_decoded_frame(void *context, const can_frame &frame);
     void handle_frame(can_port_t port, const can_frame &frame, time_point received_at);
 

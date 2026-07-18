@@ -19,7 +19,6 @@
 #include <numeric>
 #include <optional>
 #include <queue>
-#include <random>
 #include <span>
 #include <sstream>
 #include <string>
@@ -36,13 +35,15 @@ using clock_type = std::chrono::steady_clock;
 using clock_time = clock_type::time_point;
 
 constexpr auto control_period = 2500us;
-constexpr auto feedback_max_age = control_period * 2;
+constexpr auto feedback_max_age = 2ms;
 constexpr size_t bus_count = 2;
-constexpr size_t motors_per_bus = 16;
+constexpr size_t can_ports_per_bus = 2;
+constexpr size_t motors_per_can_port = 8;
+constexpr size_t motors_per_bus = can_ports_per_bus * motors_per_can_port;
 constexpr size_t motor_count = bus_count * motors_per_bus;
 constexpr uint32_t can_bitrate = 1'000'000;
 constexpr uint32_t classic_can_frame_bits = 128;
-constexpr auto feedback_frame_time =
+constexpr auto can_frame_time =
     std::chrono::nanoseconds{1'000'000'000ULL * classic_can_frame_bits / can_bitrate};
 constexpr uint32_t default_seed = 0x5EED1234U;
 constexpr float pi = 3.14159265358979323846F;
@@ -57,7 +58,8 @@ struct options {
     int fifo_priority = 80;
     std::chrono::microseconds deadline_runtime = 500us;
     std::chrono::microseconds deadline = 2000us;
-    bool lock_memory = true;
+    uint32_t stale_fail_cycles = 3;
+    bool lock_memory = false;
     std::string output;
 };
 
@@ -134,7 +136,7 @@ struct pending_later {
 class motor_mock_bus {
   public:
     explicit motor_mock_bus(uint32_t seed)
-        : socket_(io_, udp::endpoint(asio::ip::make_address("127.0.0.1"), 0)), rng_(seed) {
+        : socket_(io_, udp::endpoint(asio::ip::make_address("127.0.0.1"), 0)), seed_(seed) {
         socket_.non_blocking(true);
     }
 
@@ -158,8 +160,30 @@ class motor_mock_bus {
     uint64_t decode_errors() const noexcept { return decode_errors_.load(); }
 
   private:
+    struct prepared_feedback {
+        std::chrono::microseconds delay{};
+        clock_time ready{};
+        can_frame frame;
+        udp::endpoint peer;
+    };
+
     static void collect_frame(void *context, const can_frame &frame) {
         static_cast<std::vector<can_frame> *>(context)->push_back(frame);
+    }
+
+    static uint64_t mix(uint64_t value) noexcept {
+        value += 0x9E3779B97F4A7C15ULL;
+        value = (value ^ (value >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+        value = (value ^ (value >> 27U)) * 0x94D049BB133111EBULL;
+        return value ^ (value >> 31U);
+    }
+
+    std::chrono::microseconds feedback_delay(const can_frame &frame) const noexcept {
+        const auto position = read<can_field::pvt::Position>(frame).value_or(0U);
+        const uint64_t key = static_cast<uint64_t>(seed_) << 32U |
+                             static_cast<uint64_t>(frame.port) << 24U |
+                             static_cast<uint64_t>(frame.id) << 16U | position;
+        return std::chrono::microseconds{50U + mix(key) % 301U};
     }
 
     std::optional<can_frame> make_status1(const can_frame &command) {
@@ -186,46 +210,79 @@ class motor_mock_bus {
     }
 
     void receive_commands() {
-        std::array<uint8_t, motor_codec::MAX_PACKET_SZ> bytes{};
-        udp::endpoint peer;
-        asio::error_code error;
-        const auto size = socket_.receive_from(asio::buffer(bytes), peer, 0, error);
-        if (error == asio::error::would_block || error == asio::error::try_again)
-            return;
-        if (error) {
-            if (error != asio::error::operation_aborted)
-                ++decode_errors_;
-            return;
-        }
+        std::array<std::vector<prepared_feedback>, can_ports_per_bus> prepared;
+        for (auto &items : prepared)
+            items.reserve(motors_per_can_port);
+        while (true) {
+            std::array<uint8_t, motor_codec::MAX_PACKET_SZ> bytes{};
+            udp::endpoint peer;
+            asio::error_code error;
+            const auto size = socket_.receive_from(asio::buffer(bytes), peer, 0, error);
+            if (error == asio::error::would_block || error == asio::error::try_again)
+                break;
+            if (error) {
+                if (error != asio::error::operation_aborted)
+                    ++decode_errors_;
+                break;
+            }
 
-        std::vector<can_frame> frames;
-        frames.reserve(motors_per_bus);
-        if (motor_codec::decode_each(bytes_view(bytes.data(), size), &frames, &collect_frame)) {
-            ++decode_errors_;
-            return;
-        }
-
-        const auto received_at = clock_type::now();
-        std::uniform_int_distribution<int> random_delay_us(50, 350);
-        for (const auto &frame : frames) {
-            const auto status = make_status1(frame);
-            if (!status) {
+            std::vector<can_frame> frames;
+            frames.reserve(motors_per_bus);
+            if (motor_codec::decode_each(bytes_view(bytes.data(), size), &frames, &collect_frame)) {
                 ++decode_errors_;
                 continue;
             }
-            ++commands_;
-            auto due = received_at + std::chrono::microseconds(random_delay_us(rng_));
-            due = std::max(due, next_feedback_slot_);
-            next_feedback_slot_ = due + feedback_frame_time;
-            pending_.push({.due = due, .order = next_order_++, .frame = *status, .peer = peer});
+
+            for (const auto &frame : frames) {
+                if (frame.port >= can_ports_per_bus) {
+                    ++decode_errors_;
+                    continue;
+                }
+                const auto status = make_status1(frame);
+                if (!status) {
+                    ++decode_errors_;
+                    continue;
+                }
+                ++commands_;
+                prepared[static_cast<size_t>(frame.port)].push_back({
+                    .delay = feedback_delay(frame),
+                    .frame = *status,
+                    .peer = peer,
+                });
+            }
+        }
+
+        const auto received_at = clock_type::now();
+        for (size_t port = 0; port < can_ports_per_bus; ++port) {
+            auto &items = prepared[port];
+            auto &bus_cursor = next_bus_slot_[port];
+            bus_cursor = std::max(bus_cursor, received_at);
+            for (auto &item : items) {
+                bus_cursor += can_frame_time;
+                item.ready = bus_cursor + item.delay;
+            }
+            std::ranges::sort(items, {}, &prepared_feedback::ready);
+            for (const auto &item : items) {
+                bus_cursor = std::max(bus_cursor, item.ready) + can_frame_time;
+                pending_[port].push({.due = bus_cursor,
+                                     .order = next_order_++,
+                                     .frame = item.frame,
+                                     .peer = item.peer});
+            }
         }
     }
 
     void send_due_feedback() {
         const auto now = clock_type::now();
-        while (!pending_.empty() && pending_.top().due <= now) {
-            const auto item = pending_.top();
-            pending_.pop();
+        for (size_t port = 0; port < can_ports_per_bus; ++port) {
+            auto &queue = pending_[port];
+            if (queue.empty() || queue.top().due > now)
+                continue;
+            if (last_feedback_sent_[port] != clock_time{} &&
+                now - last_feedback_sent_[port] < can_frame_time)
+                continue;
+            const auto item = queue.top();
+            queue.pop();
 
             std::array<uint8_t, motor_codec::MAX_PACKET_SZ> bytes{};
             const auto size = motor_codec::encode_into(bytes_mut(bytes), TYPE_CAN2UDP,
@@ -240,6 +297,7 @@ class motor_mock_bus {
                 ++decode_errors_;
             } else {
                 ++feedbacks_;
+                last_feedback_sent_[port] = clock_type::now();
             }
         }
     }
@@ -254,10 +312,13 @@ class motor_mock_bus {
 
     asio::io_context io_;
     udp::socket socket_;
-    std::mt19937 rng_;
+    uint32_t seed_;
     std::optional<std::jthread> worker_;
-    std::priority_queue<pending_feedback, std::vector<pending_feedback>, pending_later> pending_;
-    clock_time next_feedback_slot_{};
+    std::array<std::priority_queue<pending_feedback, std::vector<pending_feedback>, pending_later>,
+               can_ports_per_bus>
+        pending_;
+    std::array<clock_time, can_ports_per_bus> next_bus_slot_{};
+    std::array<clock_time, can_ports_per_bus> last_feedback_sent_{};
     uint64_t next_order_ = 0;
     std::atomic<uint64_t> commands_{0};
     std::atomic<uint64_t> feedbacks_{0};
@@ -310,15 +371,18 @@ options parse_options(int argc, char **argv) {
             parsed.deadline_runtime = std::chrono::microseconds(std::stoul(std::string(value(index))));
         } else if (arg == "--deadline-us") {
             parsed.deadline = std::chrono::microseconds(std::stoul(std::string(value(index))));
-        } else if (arg == "--no-mlock") {
-            parsed.lock_memory = false;
+        } else if (arg == "--stale-fail-cycles") {
+            parsed.stale_fail_cycles = static_cast<uint32_t>(
+                std::stoul(std::string(value(index))));
+        } else if (arg == "--mlock") {
+            parsed.lock_memory = true;
         } else if (arg == "--output") {
             parsed.output = value(index);
         } else if (arg == "--help") {
-            std::cout << "realtime_pvt_stress --profile baseline|fair|fifo|deadline-control|deadline-all "
+            std::cout << "realtime_pvt_stress --profile baseline|fair|fifo|deadline-cpuset "
                          "[--duration SEC] [--warmup SEC] [--seed N] [--irq-cpu N] "
                          "[--control-cpus 4,5,6,7] [--runtime-us N] [--deadline-us N] "
-                         "[--no-mlock] [--output FILE]\n";
+                         "[--stale-fail-cycles N] [--mlock] [--output FILE]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown option: " + std::string(arg));
@@ -338,6 +402,7 @@ struct scheduling_pair {
 
 scheduling_pair scheduling_for(const options &opts) {
     scheduling_pair config;
+    config.control.lock_memory = opts.lock_memory;
     const auto deadline = linux_thread_config{
         .policy = linux_scheduler_policy::deadline,
         .cpus = opts.control_cpus,
@@ -359,15 +424,9 @@ scheduling_pair scheduling_for(const options &opts) {
     if (opts.profile == "fifo") {
         config.control.policy = linux_scheduler_policy::fifo;
         config.control.fifo_priority = opts.fifo_priority;
-        config.control.lock_memory = opts.lock_memory;
         return config;
     }
-    if (opts.profile == "deadline-control") {
-        config.control = deadline;
-        config.control.lock_memory = opts.lock_memory;
-        return config;
-    }
-    if (opts.profile == "deadline-all") {
+    if (opts.profile == "deadline-cpuset") {
         config.rx = deadline;
         config.rx.runtime = std::min(200us, opts.deadline_runtime);
         config.control = deadline;
@@ -384,7 +443,7 @@ fleet_config make_config(const std::array<uint16_t, bus_count> &ports,
         const auto channel_name = "mock" + std::to_string(bus);
         config.channels.push_back({
             .name = channel_name,
-            .max_bandwidth_bps = can_bitrate,
+            .max_bandwidth_bps = can_bitrate * can_ports_per_bus,
             .send_queue_slots = 1024,
             .remote_address = "127.0.0.1",
             .remote_port = ports[bus],
@@ -392,12 +451,14 @@ fleet_config make_config(const std::array<uint16_t, bus_count> &ports,
             .rx_thread = rx_config,
         });
         for (size_t motor = 0; motor < motors_per_bus; ++motor) {
+            const auto can_port = motor / motors_per_can_port;
+            const auto can_id = motor % motors_per_can_port + 1U;
             config.motors.push_back({
                 .name = channel_name + "_motor" + std::to_string(motor),
                 .channel = channel_name,
                 .model = "EC-A2806-P2-36",
-                .can_port = 0,
-                .can_id = static_cast<can_id_t>(motor + 1),
+                .can_port = static_cast<can_port_t>(can_port),
+                .can_id = static_cast<can_id_t>(can_id),
             });
         }
     }
@@ -431,6 +492,8 @@ benchmark_result run_control(const options &opts, const linux_thread_config &tun
     std::vector<pvt_command> commands;
     commands.reserve(motor_count);
     std::array<uint64_t, motor_count> last_feedback_seq{};
+    std::array<uint8_t, motor_count> consecutive_stale{};
+    std::array<bool, motor_count> feedback_valid{};
     std::array<clock_time, 65536> sent_at{};
     std::array<bool, 65536> sent_valid{};
 
@@ -441,21 +504,20 @@ benchmark_result run_control(const options &opts, const linux_thread_config &tun
 
     rusage usage_start{};
     rusage usage_end{};
-    getrusage(RUSAGE_THREAD, &usage_start);
-    const auto cpu_started = thread_cpu_time_ns();
+    int64_t cpu_started = 0;
+    clock_time measurement_started{};
+    bool measurement_stats_started = false;
     const auto started = clock_type::now();
     const auto measure_from = started + opts.warmup;
     const auto finish_at = measure_from + opts.duration;
     auto next_time = started;
     uint64_t iteration = 0;
 
-    const auto send_targets = [&](uint16_t raw, bool require_fresh, clock_time now) {
+    const auto send_targets = [&](uint16_t raw, clock_time now, bool measuring) {
         commands.clear();
-        for (const auto &motor : motors) {
-            if (require_fresh && !motor->pvt_feedback().fresh(now, feedback_max_age))
-                continue;
+        for (size_t index = 0; index < motors.size(); ++index) {
             commands.push_back({
-                .device_id = motor->id(),
+                .device_id = motors[index]->id(),
                 .gains = {.kp = 18.0F, .kd = 0.4F, .ki = 0.0F},
                 .position_r = position_for_raw(raw),
                 .velocity_radps = 0.0F,
@@ -467,50 +529,76 @@ benchmark_result run_control(const options &opts, const linux_thread_config &tun
         if (!commands.empty()) {
             if (const auto error = command(std::span<const pvt_command>(commands))) {
                 ++result.command_errors;
-            } else if (now >= measure_from) {
+            } else if (measuring) {
                 result.commands_sent += commands.size();
             }
         }
     };
 
-    send_targets(20'000U, false, started);
+    send_targets(20'000U, started, false);
     while (next_time + control_period <= finish_at) {
         next_time += control_period;
         std::this_thread::sleep_until(next_time);
         const auto woke_at = clock_type::now();
         const bool measuring = woke_at >= measure_from;
+        bool deadline_missed = woke_at >= next_time + control_period;
         if (measuring) {
+            if (!measurement_stats_started) {
+                getrusage(RUSAGE_THREAD, &usage_start);
+                cpu_started = thread_cpu_time_ns();
+                measurement_started = woke_at;
+                measurement_stats_started = true;
+            }
             ++result.cycles;
             jitter.push_back(std::max(0.0, elapsed_us(next_time, woke_at)));
         }
 
+        bool feedback_failure = false;
         for (size_t index = 0; index < motors.size(); ++index) {
             const auto snapshot = motors[index]->pvt_feedback();
-            if (!snapshot.fresh(woke_at, feedback_max_age)) {
-                if (measuring)
-                    ++result.stale_feedback;
-                continue;
-            }
-            if (snapshot.position_deg.seq == last_feedback_seq[index])
-                continue;
-            last_feedback_seq[index] = snapshot.position_deg.seq;
-            if (!measuring)
-                continue;
+            feedback_valid[index] = snapshot.fresh(woke_at, feedback_max_age) &&
+                                    snapshot.error.value == motor_err::none;
 
-            ++result.feedback_received;
-            rx_to_control.push_back(elapsed_us(snapshot.position_deg.time, woke_at));
-            const auto raw = raw_from_snapshot(snapshot);
-            if (sent_valid[raw])
-                end_to_end.push_back(elapsed_us(sent_at[raw], woke_at));
+            if (snapshot.coherent() && snapshot.position_deg.seq != last_feedback_seq[index]) {
+                last_feedback_seq[index] = snapshot.position_deg.seq;
+                if (measuring) {
+                    ++result.feedback_received;
+                    rx_to_control.push_back(elapsed_us(snapshot.position_deg.time, woke_at));
+                    const auto raw = raw_from_snapshot(snapshot);
+                    if (sent_valid[raw])
+                        end_to_end.push_back(elapsed_us(sent_at[raw], woke_at));
+                }
+            }
+
+            if (!feedback_valid[index]) {
+                if (measuring) {
+                    ++result.stale_feedback;
+                    if (++consecutive_stale[index] >= opts.stale_fail_cycles &&
+                        opts.stale_fail_cycles != 0U)
+                        feedback_failure = true;
+                }
+            } else {
+                consecutive_stale[index] = 0;
+            }
+        }
+
+        if (feedback_failure) {
+            result.error = std::to_string(opts.stale_fail_cycles) +
+                           " consecutive stale feedback cycles (2 ms limit)";
+            if (measuring && deadline_missed)
+                ++result.deadline_misses;
+            break;
         }
 
         ++iteration;
         const auto raw = static_cast<uint16_t>(20'000U + (iteration % 25'000U));
-        send_targets(raw, true, woke_at);
+        send_targets(raw, woke_at, measuring);
         const auto finished = clock_type::now();
         if (measuring) {
             execution.push_back(elapsed_us(woke_at, finished));
             if (finished >= next_time + control_period)
+                deadline_missed = true;
+            if (deadline_missed)
                 ++result.deadline_misses;
         }
     }
@@ -518,13 +606,17 @@ benchmark_result run_control(const options &opts, const linux_thread_config &tun
     const auto stopped = clock_type::now();
     const auto cpu_stopped = thread_cpu_time_ns();
     getrusage(RUSAGE_THREAD, &usage_end);
-    result.cpu_utilization =
-        static_cast<double>(cpu_stopped - cpu_started) /
-        static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(stopped - started).count());
-    result.voluntary_switches =
-        static_cast<uint64_t>(usage_end.ru_nvcsw - usage_start.ru_nvcsw);
-    result.involuntary_switches =
-        static_cast<uint64_t>(usage_end.ru_nivcsw - usage_start.ru_nivcsw);
+    if (measurement_stats_started) {
+        result.cpu_utilization =
+            static_cast<double>(cpu_stopped - cpu_started) /
+            static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    stopped - measurement_started)
+                                    .count());
+        result.voluntary_switches =
+            static_cast<uint64_t>(usage_end.ru_nvcsw - usage_start.ru_nvcsw);
+        result.involuntary_switches =
+            static_cast<uint64_t>(usage_end.ru_nivcsw - usage_start.ru_nivcsw);
+    }
     result.jitter_us = summarize(std::move(jitter));
     result.control_exec_us = summarize(std::move(execution));
     result.end_to_end_us = summarize(std::move(end_to_end));
@@ -611,7 +703,11 @@ int run(int argc, char **argv) {
         result.error = "mock_errors=" + std::to_string(mock_errors);
     std::cerr << "mock_commands=" << mock_commands << " mock_feedback=" << mock_feedback
               << " mock_errors=" << mock_errors << " can_frame_time_ns="
-              << feedback_frame_time.count() << '\n';
+              << can_frame_time.count() << " per_can_port_load_bps="
+              << motors_per_can_port * 2U * classic_can_frame_bits *
+                     (1'000'000ULL /
+                      std::chrono::duration_cast<std::chrono::microseconds>(control_period).count())
+              << '\n';
     write_result(opts, result);
     return result.error.empty() ? 0 : 3;
 }
