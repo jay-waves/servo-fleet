@@ -4,6 +4,7 @@
 #pragma once
 
 #include "device_motor.h"
+#include "realtime.h"
 
 #include <memory>
 #include <span>
@@ -41,11 +42,9 @@ struct fleet_config {
         std::string remote_address = "127.0.0.1";
         uint16_t remote_port = 9999;
         uint16_t local_port = 0;
+        linux_thread_config rx_thread;
     };
 
-    int command_cpu = -1;
-    int command_fifo_priority = 80;
-    bool lock_memory = true;
     std::vector<channel_config> channels;
     std::vector<motor_config> motors;
 };

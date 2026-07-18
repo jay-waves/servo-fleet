@@ -1,3 +1,5 @@
+Linux 实时 PVT 压测与调度对照实验见
+[docs/realtime-pvt-experiment.md](docs/realtime-pvt-experiment.md)。
 
 ### 项目架构图
 
@@ -112,4 +114,3 @@ cmake --build --preset debug-x64-msvc
 
 * `FLEET_BUILD_STATIC`
 * `FLEET_BUILD_TESTS`
-

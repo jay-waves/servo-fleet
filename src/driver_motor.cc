@@ -205,6 +205,7 @@ motor_driver::motor_driver(const fleet_config::channel_config &config)
               .local_port = config.local_port,
               .max_bandwidth_bps = config.max_bandwidth_bps,
               .send_queue_slots = config.send_queue_slots,
+              .rx_thread = config.rx_thread,
           })) {}
 
 motor_driver::motor_driver(std::unique_ptr<realtime_udp_channel> channel) : channel_(std::move(channel)) {}

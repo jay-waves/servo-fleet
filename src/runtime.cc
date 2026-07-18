@@ -1,7 +1,6 @@
 #include "runtime.h"
 
 #include "log.h"
-#include "thread_tuning.h"
 
 #include <algorithm>
 #include <atomic>
@@ -140,14 +139,6 @@ err_code runtime_t::bind_motors() {
 
 err_code runtime_t::start() {
     try {
-        if (options_.command_cpu >= 0) {
-            tune_current_thread({
-                .cpu = options_.command_cpu,
-                .fifo_priority = options_.command_fifo_priority,
-                .lock_memory = options_.lock_memory,
-                .name = "fleet command",
-            });
-        }
         for (auto &driver : motor_drivers_) driver->start();
     } catch (...) {
         for (auto &driver : motor_drivers_) driver->stop();

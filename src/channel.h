@@ -6,6 +6,7 @@
 
 #include "error.h"
 #include "fleet/device.h"
+#include "fleet/realtime.h"
 
 #include <chrono>
 #include <functional>
@@ -22,6 +23,7 @@ struct udp_channel_options {
     uint16_t local_port = 0;
     size_t max_bandwidth_bps = 1'000'000;
     uint32_t send_queue_slots = 1024;
+    linux_thread_config rx_thread;
 };
 
 /*

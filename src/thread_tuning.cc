@@ -2,52 +2,136 @@
 
 #include "log.h"
 
+#include <cerrno>
+#include <string>
+#include <system_error>
+
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace fleet {
 namespace {
 
+err_code generic_error(int value) noexcept {
+    return value == 0 ? err_code{} : err_code(value, std::generic_category());
+}
+
 #ifdef __linux__
-void set_affinity(pthread_t thread, const thread_tuning &tuning) noexcept {
-    if (tuning.cpu < 0)
-        return;
+
+#ifndef SCHED_DEADLINE
+#define SCHED_DEADLINE 6
+#endif
+
+struct sched_attr {
+    uint32_t size;
+    uint32_t sched_policy;
+    uint64_t sched_flags;
+    int32_t sched_nice;
+    uint32_t sched_priority;
+    uint64_t sched_runtime;
+    uint64_t sched_deadline;
+    uint64_t sched_period;
+};
+
+err_code set_name(std::string_view name) noexcept {
+    if (name.empty())
+        return {};
+    const std::string short_name{name.substr(0, 15)};
+    return generic_error(pthread_setname_np(pthread_self(), short_name.c_str()));
+}
+
+err_code set_affinity(const linux_thread_config &config) noexcept {
+    if (config.cpus.empty())
+        return {};
 
     cpu_set_t cpus;
     CPU_ZERO(&cpus);
-    CPU_SET(tuning.cpu, &cpus);
-    if (const int err = pthread_setaffinity_np(thread, sizeof(cpus), &cpus); err != 0) {
-        FLEET_WARN("thread '{}' cpu affinity failed cpu={} err={}", tuning.name, tuning.cpu, err);
+    for (const auto cpu : config.cpus) {
+        if (cpu < 0 || cpu >= CPU_SETSIZE)
+            return generic_error(EINVAL);
+        CPU_SET(cpu, &cpus);
     }
+    return generic_error(pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus));
 }
 
-void set_fifo(pthread_t thread, const thread_tuning &tuning) noexcept {
-    if (tuning.fifo_priority <= 0)
-        return;
-
-    sched_param param{};
-    param.sched_priority = tuning.fifo_priority;
-    if (const int err = pthread_setschedparam(thread, SCHED_FIFO, &param); err != 0) {
-        FLEET_WARN("thread '{}' SCHED_FIFO failed priority={} err={}", tuning.name, tuning.fifo_priority, err);
-    }
+err_code set_posix_policy(int policy, int priority) noexcept {
+    sched_param parameter{};
+    parameter.sched_priority = priority;
+    return generic_error(pthread_setschedparam(pthread_self(), policy, &parameter));
 }
+
+err_code set_deadline(const linux_thread_config &config) noexcept {
+    if (config.runtime <= std::chrono::nanoseconds::zero() ||
+        config.runtime > config.deadline || config.deadline > config.period) {
+        return generic_error(EINVAL);
+    }
+
+    sched_attr attribute{
+        .size = sizeof(sched_attr),
+        .sched_policy = SCHED_DEADLINE,
+        .sched_flags = 0,
+        .sched_nice = 0,
+        .sched_priority = 0,
+        .sched_runtime = static_cast<uint64_t>(config.runtime.count()),
+        .sched_deadline = static_cast<uint64_t>(config.deadline.count()),
+        .sched_period = static_cast<uint64_t>(config.period.count()),
+    };
+    if (syscall(SYS_sched_setattr, 0, &attribute, 0) == 0)
+        return {};
+    return generic_error(errno);
+}
+
+err_code set_policy(const linux_thread_config &config) noexcept {
+    switch (config.policy) {
+    case linux_scheduler_policy::inherit:
+        return {};
+    case linux_scheduler_policy::other:
+        return set_posix_policy(SCHED_OTHER, 0);
+    case linux_scheduler_policy::fifo:
+        if (config.fifo_priority < sched_get_priority_min(SCHED_FIFO) ||
+            config.fifo_priority > sched_get_priority_max(SCHED_FIFO)) {
+            return generic_error(EINVAL);
+        }
+        return set_posix_policy(SCHED_FIFO, config.fifo_priority);
+    case linux_scheduler_policy::deadline:
+        return set_deadline(config);
+    }
+    return generic_error(EINVAL);
+}
+
 #endif
 
 } // namespace
 
-void tune_current_thread(const thread_tuning &tuning) noexcept {
+err_code tune_current_thread(const linux_thread_config &config, std::string_view name) noexcept {
 #ifdef __linux__
-    const auto self = pthread_self();
-    set_affinity(self, tuning);
-    set_fifo(self, tuning);
-    if (tuning.lock_memory && mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-        FLEET_WARN("thread '{}' mlockall failed", tuning.name);
+    if (const auto error = set_name(name)) {
+        FLEET_WARN("thread '{}' set name failed error={}", name, error.message());
+        return error;
     }
+    if (const auto error = set_affinity(config)) {
+        FLEET_WARN("thread '{}' set affinity failed error={}", name, error.message());
+        return error;
+    }
+    if (const auto error = set_policy(config)) {
+        FLEET_WARN("thread '{}' set scheduler failed policy={} error={}", name,
+                   static_cast<int>(config.policy), error.message());
+        return error;
+    }
+    if (config.lock_memory && mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        const auto error = generic_error(errno);
+        FLEET_WARN("thread '{}' mlockall failed error={}", name, error.message());
+        return error;
+    }
+    return {};
 #else
-    (void)tuning;
+    (void)name;
+    return config.configured() ? make_error_code(fleet_err::unsupported) : err_code{};
 #endif
 }
 

@@ -1,5 +1,6 @@
 #include "log.h"
 #include "channel.h"
+#include "thread_tuning.h"
 
 #include <asio.hpp>
 
@@ -14,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <future>
 #include <utility>
 #include <vector>
 
@@ -499,7 +501,16 @@ struct realtime_udp_channel::impl {
         if (stopped.load()) {
             throw std::logic_error("stopped async udp channel cannot be restarted");
         }
-        rx_thread.emplace([this](std::stop_token stop_token) { rx_loop(stop_token); });
+        std::promise<err_code> rx_ready;
+        auto rx_result = rx_ready.get_future();
+        rx_thread.emplace([this, ready = std::move(rx_ready)](std::stop_token stop_token) mutable {
+            rx_loop(stop_token, std::move(ready));
+        });
+        if (const auto error = rx_result.get()) {
+            rx_thread->request_stop();
+            rx_thread.reset();
+            throw std::system_error(error);
+        }
         tx_thread.emplace([this](std::stop_token stop_token) { tx_loop(stop_token); });
     }
 
@@ -586,7 +597,11 @@ struct realtime_udp_channel::impl {
         }
     }
 
-    void rx_loop(const std::stop_token &stop_token) {
+    void rx_loop(const std::stop_token &stop_token, std::promise<err_code> ready) {
+        const auto tuning_error = tune_current_thread(options.rx_thread, name + "-rx");
+        ready.set_value(tuning_error);
+        if (tuning_error)
+            return;
         std::array<uint8_t, MAX_UDP_SIZE> buffer{};
         while (!stop_token.stop_requested() && !is_stopped()) {
             udp::endpoint sender;
