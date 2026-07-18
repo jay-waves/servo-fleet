@@ -36,6 +36,7 @@ set(FLEET_SOURCES
 add_library(${FLEET_TARGET}_obj OBJECT ${FLEET_SOURCES})
 target_compile_features(${FLEET_TARGET}_obj PUBLIC cxx_std_23)
 target_compile_definitions(${FLEET_TARGET}_obj PUBLIC)
+set_target_properties(${FLEET_TARGET}_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(${FLEET_TARGET}_obj
   PUBLIC

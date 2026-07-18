@@ -8,6 +8,7 @@ FetchContent_Declare(
 set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_PIC ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
   spdlog
   URL https://github.com/gabime/spdlog/archive/refs/tags/v1.17.0.zip

@@ -55,6 +55,16 @@ TEST_CASE("motor samples preserve update time for caller-side freshness checks")
     CHECK(position.value > 57.0F);
     CHECK(std::chrono::steady_clock::now() - position.time > 10ms);
     CHECK(error.value == motor_err::none);
+
+    const auto pvt = motor.pvt_feedback();
+    CHECK(pvt.received());
+    CHECK(pvt.coherent());
+    CHECK(pvt.position_deg.seq == position.seq);
+    CHECK(pvt.position_deg.value == doctest::Approx(position.value));
+    CHECK(pvt.velocity_rpm.value > 19.0F);
+    CHECK(pvt.current.value == doctest::Approx(3.0F));
+    CHECK(pvt.fresh(std::chrono::steady_clock::now(), 100ms));
+    CHECK_FALSE(pvt.fresh(std::chrono::steady_clock::now(), 1ms));
 }
 
 TEST_CASE("motor model table supplies pvt limits and status current range") {

@@ -94,7 +94,7 @@ template <typename T> struct sample_t {
 
     bool received() const noexcept { return seq != 0; }
 
-    bool fresh(time_point now, milliseconds max_age) const noexcept {
+    bool fresh(time_point now, duration max_age) const noexcept {
         return received() && now - time <= max_age;
     }
 
