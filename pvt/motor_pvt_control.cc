@@ -2,6 +2,7 @@
 #include "fleet/fleet.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <exception>
 #include <memory>
@@ -22,9 +23,9 @@ constexpr float deg_to_rad = pi / 180.0f;
 constexpr float rad_to_deg = 180.0f / pi;
 constexpr float pvt_position_limit_r = 12.5f;
 
-constexpr milliseconds command_period = 10ms;
+constexpr auto command_period = 2500us;
 constexpr milliseconds query_wait = 100ms;
-constexpr milliseconds feedback_max_age = 250ms;
+constexpr auto feedback_max_age = command_period * 2;
 constexpr milliseconds startup_wait = 300ms;
 constexpr milliseconds settle_duration = 1500ms;
 constexpr milliseconds tune_duration = 12000ms;
@@ -66,6 +67,42 @@ const fleet_config pvt_config{
 };
 
 using motor_ptr = std::shared_ptr<motor::motor_interface>;
+
+struct pvt_target {
+    float position_r = 0.0f;
+    float velocity_radps = 0.0f;
+};
+
+struct pvt_loop_stats {
+    uint64_t cycles = 0;
+    uint64_t commands_sent = 0;
+    uint64_t stale_feedback = 0;
+    uint64_t rejected_feedback = 0;
+    uint64_t command_errors = 0;
+    uint64_t deadline_misses = 0;
+    duration max_wakeup_lateness{};
+
+    pvt_loop_stats &operator+=(const pvt_loop_stats &other) {
+        cycles += other.cycles;
+        commands_sent += other.commands_sent;
+        stale_feedback += other.stale_feedback;
+        rejected_feedback += other.rejected_feedback;
+        command_errors += other.command_errors;
+        deadline_misses += other.deadline_misses;
+        max_wakeup_lateness = std::max(max_wakeup_lateness, other.max_wakeup_lateness);
+        return *this;
+    }
+};
+
+void report_loop_stats(std::string_view phase, const pvt_loop_stats &stats) {
+    const auto max_lateness_us =
+        std::chrono::duration<double, std::micro>(stats.max_wakeup_lateness).count();
+    FLEET_INFO("pvt tune loop phase={} period_us={} cycles={} commands={} stale={} "
+               "rejected={} command_errors={} deadline_misses={} max_wakeup_lateness_us={}",
+               phase, std::chrono::duration_cast<std::chrono::microseconds>(command_period).count(),
+               stats.cycles, stats.commands_sent, stats.stale_feedback, stats.rejected_feedback,
+               stats.command_errors, stats.deadline_misses, max_lateness_us);
+}
 
 const fleet_config::channel_config *find_channel(std::string_view name) {
     for (const auto &channel : pvt_config.channels) {
@@ -189,22 +226,20 @@ void print_feedback(const motor_ptr &motor) {
                            current_value, current_fresh);
 }
 
-void print_tracking_error(const motor_ptr &motor, float target_position_r,
+void print_tracking_error(const motor::pvt_feedback_snapshot &snapshot, float target_position_r,
                           float target_velocity_radps) {
-    const auto position = motor->position_deg();
-    const auto velocity = motor->velocity_rpm();
-    const auto current = motor->current();
     const auto now = std::chrono::steady_clock::now();
-    const auto position_fresh = position.fresh(now, feedback_max_age);
-    const auto velocity_fresh = velocity.fresh(now, feedback_max_age);
-    const auto current_fresh = current.fresh(now, feedback_max_age);
+    const auto position_fresh = snapshot.position_deg.fresh(now, feedback_max_age);
+    const auto velocity_fresh = snapshot.velocity_rpm.fresh(now, feedback_max_age);
+    const auto current_fresh = snapshot.current.fresh(now, feedback_max_age);
 
     const auto actual_position_r =
         position_fresh
-            ? checked_pvt_position(position.value * deg_to_rad, "feedback").value_or(target_position_r)
+            ? checked_pvt_position(snapshot.position_deg.value * deg_to_rad, "feedback")
+                  .value_or(target_position_r)
             : target_position_r;
     const auto actual_velocity_radps =
-        velocity_fresh ? velocity.value * 2.0f * pi / 60.0f : 0.0f;
+        velocity_fresh ? snapshot.velocity_rpm.value * 2.0f * pi / 60.0f : 0.0f;
     const auto position_error_r = target_position_r - actual_position_r;
     const auto velocity_error_radps = target_velocity_radps - actual_velocity_radps;
 
@@ -212,7 +247,7 @@ void print_tracking_error(const motor_ptr &motor, float target_position_r,
              "actual_radps={} error_radps={} current_a={} sample_fresh=pos:{} vel:{} cur:{}",
              target_position_r * rad_to_deg, actual_position_r * rad_to_deg,
              position_error_r * rad_to_deg, target_velocity_radps, actual_velocity_radps,
-             velocity_error_radps, current_fresh ? current.value : 0.0f, position_fresh,
+             velocity_error_radps, current_fresh ? snapshot.current.value : 0.0f, position_fresh,
              velocity_fresh, current_fresh);
 }
 
@@ -326,17 +361,85 @@ bool send_pvt(const motor_ptr &motor, float position_r, float velocity_radps) {
     return true;
 }
 
-bool hold_position(const motor_ptr &motor, float position_r, milliseconds duration) {
-    FLEET_INFO("pvt tune hold position duration_ms={} position_deg={}", duration.count(),
-             position_r * rad_to_deg);
+template <typename TargetFn>
+bool run_stable_pvt_loop(const motor_ptr &motor, duration run_duration, TargetFn &&target_at,
+                         std::string_view phase, pvt_loop_stats &total_stats) {
+    pvt_loop_stats stats;
     const auto start = std::chrono::steady_clock::now();
-    while (std::chrono::steady_clock::now() - start < duration) {
-        if (!send_pvt(motor, position_r, 0.0f)) {
+    auto next_time = start;
+    auto last_print = start;
+
+    // Seed one Status1 response. Subsequent iterations reject stale feedback before sending.
+    const auto initial = target_at(duration::zero());
+    if (!send_pvt(motor, initial.position_r, initial.velocity_radps)) {
+        ++stats.command_errors;
+        total_stats += stats;
+        report_loop_stats(phase, stats);
+        return false;
+    }
+    ++stats.commands_sent;
+
+    while (next_time + command_period <= start + run_duration) {
+        next_time += command_period;
+        std::this_thread::sleep_until(next_time);
+
+        const auto woke_at = std::chrono::steady_clock::now();
+        ++stats.cycles;
+        if (woke_at > next_time) {
+            stats.max_wakeup_lateness =
+                std::max(stats.max_wakeup_lateness, woke_at - next_time);
+        }
+
+        const auto snapshot = motor->pvt_feedback();
+        if (!snapshot.fresh(woke_at, feedback_max_age)) {
+            ++stats.stale_feedback;
+            if (woke_at - last_print >= 1s) {
+                FLEET_WARN("pvt tune stale feedback phase={} count={} received={} coherent={}",
+                           phase, stats.stale_feedback, snapshot.received(), snapshot.coherent());
+                last_print = woke_at;
+            }
+            continue;
+        }
+        if (snapshot.error.value != motor_err::none) {
+            ++stats.rejected_feedback;
+            continue;
+        }
+
+        // Use actual wake time so an overrun computes the latest trajectory point instead of
+        // replaying an obsolete target.
+        const auto target = target_at(woke_at - start);
+        if (!send_pvt(motor, target.position_r, target.velocity_radps)) {
+            ++stats.command_errors;
+            total_stats += stats;
+            report_loop_stats(phase, stats);
             return false;
         }
-        std::this_thread::sleep_for(command_period);
+        ++stats.commands_sent;
+
+        if (woke_at - last_print >= 1s) {
+            print_tracking_error(snapshot, target.position_r, target.velocity_radps);
+            last_print = woke_at;
+        }
+
+        const auto finished_at = std::chrono::steady_clock::now();
+        if (finished_at >= next_time + command_period) {
+            stats.deadline_misses += static_cast<uint64_t>(
+                (finished_at - next_time) / command_period);
+        }
     }
+
+    total_stats += stats;
+    report_loop_stats(phase, stats);
     return true;
+}
+
+bool hold_position(const motor_ptr &motor, float position_r, milliseconds hold_duration,
+                   pvt_loop_stats &stats) {
+    FLEET_INFO("pvt tune hold position duration_ms={} position_deg={}", hold_duration.count(),
+               position_r * rad_to_deg);
+    return run_stable_pvt_loop(
+        motor, hold_duration,
+        [position_r](duration) { return pvt_target{.position_r = position_r}; }, "hold", stats);
 }
 
 bool run_pvt_tuning(const motor_ptr &motor) {
@@ -355,37 +458,30 @@ bool run_pvt_tuning(const motor_ptr &motor) {
              origin_r * rad_to_deg, pvt_kp, pvt_kd, tune_amplitude_deg, tune_frequency_hz,
              tune_duration.count(), pvt_current_limit_a);
 
-    if (!hold_position(motor, origin_r, settle_duration)) {
+    pvt_loop_stats stats;
+    if (!hold_position(motor, origin_r, settle_duration, stats)) {
         return false;
     }
 
-    const auto start = std::chrono::steady_clock::now();
-    auto last_print = start;
-    while (true) {
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed = now - start;
-        if (elapsed >= tune_duration) {
-            break;
-        }
-
-        const auto t = std::chrono::duration<float>(elapsed).count();
-        const auto position = origin_r + amplitude_r * std::sin(omega * t);
-        const auto velocity = std::clamp(amplitude_r * omega * std::cos(omega * t),
-                                         -max_velocity_radps, max_velocity_radps);
-        if (!send_pvt(motor, position, velocity)) {
-            return false;
-        }
-
-        if (now - last_print >= 1s) {
-            print_tracking_error(motor, position, velocity);
-            last_print = now;
-        }
-
-        std::this_thread::sleep_for(command_period);
+    if (!run_stable_pvt_loop(
+            motor, tune_duration,
+            [=](duration elapsed) {
+                const auto t = std::chrono::duration<float>(elapsed).count();
+                return pvt_target{
+                    .position_r = origin_r + amplitude_r * std::sin(omega * t),
+                    .velocity_radps =
+                        std::clamp(amplitude_r * omega * std::cos(omega * t),
+                                   -max_velocity_radps, max_velocity_radps),
+                };
+            },
+            "trajectory", stats)) {
+        return false;
     }
 
     FLEET_INFO("pvt tune return to origin position_deg={}", origin_r * rad_to_deg);
-    return hold_position(motor, origin_r, settle_duration);
+    const auto ok = hold_position(motor, origin_r, settle_duration, stats);
+    report_loop_stats("total", stats);
+    return ok;
 }
 
 void stop_motor(const motor_ptr &motor) {

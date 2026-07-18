@@ -17,6 +17,7 @@ class motor_device final : public motor::motor_interface {
     motor_device(device_id_t device_id, const fleet_config::motor_config& config);
 
     sample_t<motor_err> motor_error() const override;
+    motor::pvt_feedback_snapshot pvt_feedback() const override;
     sample_t<float> position_deg() const override;
     sample_t<float> velocity_rpm() const override;
     sample_t<float> current() const override;
@@ -117,4 +118,3 @@ class motor_device final : public motor::motor_interface {
 };
 
 } // namespace fleet
-

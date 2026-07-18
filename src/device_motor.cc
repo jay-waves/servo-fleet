@@ -67,6 +67,16 @@ sample_t<motor_err> motor_device::motor_error() const {
     return read_sample(state_mutex_, error_.motor_error);
 }
 
+motor::pvt_feedback_snapshot motor_device::pvt_feedback() const {
+    std::lock_guard lock(state_mutex_);
+    return {
+        .error = error_.motor_error,
+        .position_deg = motion_.position_deg,
+        .velocity_rpm = motion_.velocity_rpm,
+        .current = electrical_.current,
+    };
+}
+
 sample_t<float> motor_device::position_deg() const {
     return read_sample(state_mutex_, motion_.position_deg);
 }

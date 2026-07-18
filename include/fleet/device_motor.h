@@ -205,11 +205,38 @@ struct mcu_uuid_t {
     bool complete() const noexcept { return (received_mask & 0x07U) == 0x07U; }
 };
 
+/*
+    Status1 中供 PVT 控制器使用的字段必须作为同一份快照读取，避免控制线程在
+    多次 getter 调用之间混入新的反馈帧。seq/time 一致表示字段来自同一报文。
+*/
+struct pvt_feedback_snapshot {
+    sample_t<motor_err> error;
+    sample_t<float> position_deg;
+    sample_t<float> velocity_rpm;
+    sample_t<float> current;
+
+    bool received() const noexcept {
+        return error.received() && position_deg.received() && velocity_rpm.received() &&
+               current.received();
+    }
+
+    bool coherent() const noexcept {
+        return received() && error.seq == position_deg.seq && error.seq == velocity_rpm.seq &&
+               error.seq == current.seq && error.time == position_deg.time &&
+               error.time == velocity_rpm.time && error.time == current.time;
+    }
+
+    bool fresh(time_point now, duration max_age) const noexcept {
+        return coherent() && error.fresh(now, max_age);
+    }
+};
+
 class motor_interface : public fleet::device_interface {
   public:
     ~motor_interface() override = default;
 
 	    virtual sample_t<motor_err> motor_error() const = 0;
+	    virtual pvt_feedback_snapshot pvt_feedback() const = 0;
 	    // Position queried from the motor is the accumulated angle since power-on, in degrees.
 	    virtual sample_t<float> position_deg() const = 0;
     virtual sample_t<float> velocity_rpm() const = 0;
